@@ -27,3 +27,4 @@ deb/
 # Ignore output folder containing build artefacts
 out/
 comments/
+/*.dawg
