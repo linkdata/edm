@@ -6,9 +6,11 @@ import (
 	"flag"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -27,6 +29,7 @@ import (
 
 var (
 	testDawg     = flag.Bool("test-dawg", false, "perform tests requiring a well-known-domains.dawg file")
+	dawgFile     = flag.String("dawg-file", "testdata/ignored-question-names.valid1.dawg", "path to a DAWG file for DAWG lookup benchmarks (skips the benchmark if empty)")
 	writeParquet = flag.Bool("write-parquet", false, "make parquet tests write out files in testdata directory")
 	defaultTC    = testConfiger{
 		CryptopanKey:            "key1",
@@ -67,6 +70,62 @@ func BenchmarkWKDTLookup(b *testing.B) {
 	for n := 0; n < b.N; n++ {
 		wkdTracker.lookup(m)
 	}
+}
+
+// BenchmarkDAWGLookup measures DAWG lookup throughput against a DAWG file.
+// The workload is drawn from the DAWG itself via Enumerate and shuffled
+// deterministically so the access pattern is randomised but reproducible
+// across runs.
+//
+// Defaults to the small testdata DAWG so the benchmark runs out of the box.
+// Override with -dawg-file=... to point at a real well-known-domains.dawg
+// for representative numbers:
+//
+//	go test -run='^$' -bench=BenchmarkDAWGLookup -benchmem ./pkg/runner/ \
+//	    -args -dawg-file=path/to/well-known-domains.dawg
+func BenchmarkDAWGLookup(b *testing.B) {
+	if *dawgFile == "" {
+		b.Skip("skipping: -dawg-file not set")
+	}
+
+	dawgFinder, _, err := loadDawgFile(*dawgFile)
+	if err != nil {
+		b.Fatalf("loadDawgFile: %v", err)
+	}
+
+	words := make([]string, 0, dawgFinder.NumAdded())
+	dawgFinder.Enumerate(func(_ int, w []rune, final bool) dawg.EnumerationResult {
+		if final {
+			words = append(words, string(w))
+		}
+		return dawg.Continue
+	})
+	if len(words) == 0 {
+		b.Fatal("DAWG enumeration produced no words")
+	}
+
+	rng := rand.New(rand.NewPCG(0xDA, 0x96))
+	rng.Shuffle(len(words), func(i, j int) { words[i], words[j] = words[j], words[i] })
+
+	b.Logf("loaded %d words from %s", len(words), *dawgFile)
+
+	b.Run("IndexOf", func(b *testing.B) {
+		b.ReportAllocs()
+		var sink int
+		for n := 0; n < b.N; n++ {
+			sink = dawgFinder.IndexOf(words[n%len(words)])
+		}
+		runtime.KeepAlive(sink)
+	})
+
+	b.Run("getDawgIndex", func(b *testing.B) {
+		b.ReportAllocs()
+		var sink int
+		for n := 0; n < b.N; n++ {
+			sink, _ = getDawgIndex(dawgFinder, words[n%len(words)])
+		}
+		runtime.KeepAlive(sink)
+	})
 }
 
 func BenchmarkSetLabels(b *testing.B) {
