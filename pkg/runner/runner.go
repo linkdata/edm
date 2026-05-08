@@ -71,6 +71,7 @@ type config struct {
 	DisableHistogramSender        bool   `mapstructure:"disable-histogram-sender" reload:"true"`
 	DisableMQTT                   bool   `mapstructure:"disable-mqtt"`
 	DisableMQTTFilequeue          bool   `mapstructure:"disable-mqtt-filequeue"`
+	EnableManualParquetRotation   bool   `mapstructure:"enable-manual-parquet-rotation"`
 	PebbleSync                    bool   `mapstructure:"pebble-sync" reload:"true"`
 	InputUnix                     string `mapstructure:"input-unix" validate:"required_without_all=InputTCP InputTLS,excluded_with=InputTCP InputTLS"`
 	InputTCP                      string `mapstructure:"input-tcp" validate:"required_without_all=InputUnix InputTLS,excluded_with=InputUnix InputTLS"`
@@ -256,6 +257,11 @@ type prevSessions struct {
 	sessions     []*sessionData
 	startTime    time.Time
 	rotationTime time.Time
+}
+
+type parquetRotationRequest struct {
+	rotationTime time.Time
+	done         chan error
 }
 
 type certStore struct {
@@ -1298,6 +1304,9 @@ func Run(logger *slog.Logger, loggerLevel *slog.LevelVar) {
 
 	// Setup custom promHandler since we want to use our per-edm registry
 	metricsMux.Handle("/metrics", promhttp.InstrumentMetricHandler(edm.promReg, promhttp.HandlerFor(edm.promReg, promhttp.HandlerOpts{Registry: edm.promReg})))
+	if startConf.EnableManualParquetRotation {
+		metricsMux.HandleFunc("/debug/rotate-parquet", edm.manualParquetRotationHandler)
+	}
 	go func() {
 		err := metricsServer.ListenAndServe()
 		logger.Error("metricsServer failed", "error", err)
@@ -1504,6 +1513,7 @@ type dnstapMinimiser struct {
 	debug                     bool               // if we should print debug messages during operation
 	sessionWriterCh           chan *prevSessions
 	histogramWriterCh         chan *wellKnownDomainsData
+	parquetRotationRequestCh  chan parquetRotationRequest
 	newQnamePublisherCh       chan *protocols.NewQnameJSON
 	sessionCollectorCh        chan *sessionData
 	aggregSenderMutex         sync.RWMutex
@@ -1686,6 +1696,7 @@ func newDnstapMinimiser(logger *slog.Logger, edmConf edmConfiger) (*dnstapMinimi
 	// minimiser loop, otherwise the program can hang on shutdown.
 	edm.sessionWriterCh = make(chan *prevSessions, 100)
 	edm.histogramWriterCh = make(chan *wellKnownDomainsData, 100)
+	edm.parquetRotationRequestCh = make(chan parquetRotationRequest, 1)
 	edm.newQnamePublisherCh = make(chan *protocols.NewQnameJSON, conf.NewQnameBuffer)
 	edm.sessionCollectorCh = make(chan *sessionData, 100)
 
@@ -2497,6 +2508,42 @@ func (edm *dnstapMinimiser) histogramWriter(labelLimit int, outboxDir string, wg
 	edm.log.Info("histogramWriter: exiting loop")
 }
 
+func (edm *dnstapMinimiser) manualParquetRotationHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	req := parquetRotationRequest{
+		rotationTime: time.Now().UTC(),
+		done:         make(chan error, 1),
+	}
+
+	select {
+	case edm.parquetRotationRequestCh <- req:
+	case <-edm.ctx.Done():
+		http.Error(w, "edm is shutting down", http.StatusServiceUnavailable)
+		return
+	case <-r.Context().Done():
+		return
+	}
+
+	select {
+	case err := <-req.done:
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte("rotation requested\n"))
+	case <-time.After(10 * time.Second):
+		http.Error(w, "timed out waiting for parquet rotation", http.StatusGatewayTimeout)
+	case <-r.Context().Done():
+		return
+	}
+}
+
 func (edm *dnstapMinimiser) renameFile(src string, dst string) error {
 	dstDir := filepath.Dir(dst)
 
@@ -3223,6 +3270,24 @@ func (edm *dnstapMinimiser) dataCollector(wg *sync.WaitGroup, wkd *wellKnownDoma
 		wkd.m = map[int]*histogramData{}
 	}
 
+	rotateCollectedData := func(rotationTime time.Time) error {
+		flushSessions(sessionIntervalStart, rotationTime)
+		sessionIntervalStart = rotationTime
+
+		prevWKD, err := wkd.rotateTracker(edm, dawgFile, histogramIntervalStart, rotationTime)
+		if err != nil {
+			return fmt.Errorf("unable to rotate histogram map: %w", err)
+		}
+
+		// Only write out parquet file if there is something to write.
+		if len(prevWKD.m) > 0 {
+			edm.histogramWriterCh <- prevWKD
+		}
+		histogramIntervalStart = rotationTime
+
+		return nil
+	}
+
 collectorLoop:
 	for {
 		select {
@@ -3236,20 +3301,10 @@ collectorLoop:
 			// We want to tick at the start of each minute
 			ticker.Reset(timeUntilNextMinute())
 
-			flushSessions(sessionIntervalStart, ts)
-			sessionIntervalStart = ts
-
-			prevWKD, err := wkd.rotateTracker(edm, dawgFile, histogramIntervalStart, ts)
-			if err != nil {
-				edm.log.Error("unable to rotate histogram map", "error", err)
+			if err := rotateCollectedData(ts); err != nil {
+				edm.log.Error("unable to rotate parquet data", "error", err)
 				continue
 			}
-
-			// Only write out parquet file if there is something to write
-			if len(prevWKD.m) > 0 {
-				edm.histogramWriterCh <- prevWKD
-			}
-			histogramIntervalStart = ts
 
 			// See if we need to modify anything based on a config update
 			conf = edm.getConfig()
@@ -3257,6 +3312,15 @@ collectorLoop:
 			if conf.HistogramHLLExplicitThreshold != hllSettings.ExplicitThreshold {
 				edm.log.Info("updating HLL explicit threshold based on config change", "from", hllSettings.ExplicitThreshold, "to", conf.HistogramHLLExplicitThreshold)
 				hllSettings.ExplicitThreshold = conf.HistogramHLLExplicitThreshold
+			}
+
+		case req := <-edm.parquetRotationRequestCh:
+			edm.log.Info("dataCollector: manual parquet rotation requested", "rotation_time", req.rotationTime)
+			drainCollectorQueues()
+			err := rotateCollectedData(req.rotationTime)
+			req.done <- err
+			if err != nil {
+				edm.log.Error("unable to rotate parquet data", "error", err)
 			}
 
 		case <-wkd.stop:

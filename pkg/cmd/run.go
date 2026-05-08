@@ -34,6 +34,7 @@ func init() {
 	runCmd.Flags().Bool("disable-histogram-sender", false, "do not check for histogram files to upload to core")
 	runCmd.Flags().Bool("disable-mqtt", false, "disable MQTT message sending")
 	runCmd.Flags().Bool("disable-mqtt-filequeue", false, "disable MQTT file based queue")
+	runCmd.Flags().Bool("enable-manual-parquet-rotation", false, "enable localhost HTTP endpoint for manually rotating session and histogram parquet files")
 	runCmd.Flags().Bool("pebble-sync", false, "fsync seen-qname pebble writes")
 
 	runCmd.Flags().String("input-unix", "", "create unix socket for reading dnstap (e.g. /var/lib/unbound/dnstap.sock)")
